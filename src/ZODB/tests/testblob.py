@@ -230,6 +230,131 @@ class BlobUndoTests(BlobTestBase):
 
         database.close()
 
+    def testUndoPlan(self):
+        database = DB(self._storage)
+        connection = database.open()
+        root = connection.root()
+        blob = Blob()
+
+        transaction.begin()
+        with blob.open('w') as file:
+            file.write(b'this is state 1')
+        root['blob'] = blob
+        transaction.commit()
+
+        transaction.begin()
+        blob = root['blob']
+        with blob.open('w') as file:
+            file.write(b'this is state 2')
+        transaction.commit()
+        mod_id = database.undoLog(0, 1)[0]['id']
+
+        handle = database.undoPlan([mod_id])
+        transaction.commit()
+        with blob.open('r') as file:
+            self.assertEqual(file.read(), b'this is state 1')
+        self.assertFalse(handle.already_applied)
+
+        # Repeating the same plan is recognized and does not flip
+        # anything again.
+        handle2 = database.undoPlan([mod_id])
+        transaction.commit()
+        self.assertTrue(handle2.already_applied)
+        with blob.open('r') as file:
+            self.assertEqual(file.read(), b'this is state 1')
+
+        database.close()
+
+    def testUndoPlanMultipleTargetsSameBlob(self):
+        database = DB(self._storage)
+        connection = database.open()
+        root = connection.root()
+        blob = Blob()
+
+        transaction.begin()
+        with blob.open('w') as file:
+            file.write(b'one')
+        root['blob'] = blob
+        transaction.commit()
+        transaction.begin()
+        with root['blob'].open('w') as file:
+            file.write(b'two')
+        transaction.commit()
+        transaction.begin()
+        with root['blob'].open('w') as file:
+            file.write(b'three')
+        transaction.commit()
+
+        infos = database.undoLog(0, 2)
+        database.undoPlan([infos[0]['id'], infos[1]['id']])
+        transaction.commit()
+        connection.sync()
+        with root['blob'].open('r') as file:
+            self.assertEqual(file.read(), b'one')
+
+        database.close()
+
+    def testUndoPlanMissingBlobRejectedAtomically(self):
+        import binascii
+        database = DB(self._storage)
+        connection = database.open()
+        root = connection.root()
+        blob = Blob()
+
+        transaction.begin()
+        with blob.open('w') as file:
+            file.write(b'this is state 1')
+        root['blob'] = blob
+        transaction.commit()
+
+        transaction.begin()
+        blob = root['blob']
+        with blob.open('w') as file:
+            file.write(b'this is state 2')
+        transaction.commit()
+
+        mod_id = database.undoLog(0, 1)[0]['id']
+        raw_mod_id = binascii.a2b_base64(
+            mod_id + b'\n' if isinstance(mod_id, bytes)
+            else (mod_id + '\n').encode())
+        oid = root['blob']._p_oid
+
+        # Undoing the modification would restore the blob file of the
+        # previous revision.  Remove it to simulate a missing blob.
+        _ignored, serial_before, _ignored = self._storage.loadBefore(
+            oid, raw_mod_id)
+        source = self._storage.fshelper.getBlobFilename(
+            oid, serial_before)
+        self.assertTrue(os.path.exists(source))
+        os.remove(source)
+
+        oid_path = self._storage.fshelper.getPathForOID(oid)
+        before = set(os.listdir(oid_path))
+        with self.assertRaises(ZODB.POSException.UndoPlanError) as cm:
+            database.undoPlan([mod_id])
+            transaction.commit()
+        transaction.abort()
+        self.assertEqual(
+            [f['code'] for f in cm.exception.failures],
+            ['missing-blob'])
+
+        # No partial blob restoration is left behind and the current
+        # blob state is unchanged and still readable.
+        after = set(os.listdir(oid_path))
+        self.assertEqual(before, after)
+        connection.sync()
+        with root['blob'].open('r') as file:
+            self.assertEqual(file.read(), b'this is state 2')
+
+        # The storage still works after the rejected plan.
+        transaction.begin()
+        root['other'] = 1
+        transaction.commit()
+        connection.sync()
+        self.assertEqual(root['other'], 1)
+
+        database.close()
+
     def testRedo(self):
         database = DB(self._storage)
         connection = database.open()

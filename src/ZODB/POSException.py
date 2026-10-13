@@ -309,6 +309,82 @@ class MultipleUndoErrors(UndoError):
         return "\n".join([_fmt_undo(*pair) for pair in self._errs])
 
 
+# Per-target reason codes reported by UndoPlanError:
+#
+# - 'packed':        the target transaction is past a pack boundary or
+#                    the opaque undo id is otherwise invalid
+# - 'conflict':      an object of the target was modified by a later
+#                    transaction and the change can't be resolved
+# - 'missing-blob':  a blob file required to restore an object revision
+#                    does not exist
+# - 'storage-error': a file/storage error or an uncertain storage
+#                    response made the target unsafe to apply
+UNDO_TARGET_PACKED = 'packed'
+UNDO_TARGET_CONFLICT = 'conflict'
+UNDO_TARGET_MISSING_BLOB = 'missing-blob'
+UNDO_TARGET_STORAGE_ERROR = 'storage-error'
+
+
+class UndoPlanError(UndoError):
+    """An ordered undo plan could not be applied atomically.
+
+    No part of the plan is visible to other connections: either nothing
+    was written, or the current transaction was rolled back.
+
+    ``failures`` is a sequence of per-target mappings with at least the
+    following keys:
+
+      - 'target': the opaque undo id of the failing target
+      - 'code':   one of the UNDO_TARGET_* reason codes
+      - 'reason': a human readable explanation
+      - 'oid':    the 8-byte oid of the offending object, if known
+    """
+
+    def __init__(self, failures, reason="Undo plan failed"):
+        self.failures = list(failures)
+        first = self.failures[0]
+        UndoError.__init__(self, reason, first.get('oid'))
+
+    @staticmethod
+    def failure(target, code, reason, oid=None):
+        """Build one per-target failure mapping."""
+        return {'target': target, 'code': code, 'reason': reason,
+                'oid': oid}
+
+    @property
+    def _errs(self):
+        # Be compatible with MultipleUndoError-style consumers.
+        return [(f['reason'], f.get('oid')) for f in self.failures]
+
+    def __str__(self):
+        lines = []
+        for failure in self.failures:
+            oid = failure.get('oid')
+            lines.append(_fmt_undo(
+                oid, "[%s] %s" % (failure['code'], failure['reason'])))
+        return "\n".join(lines)
+
+
+class UndoPlanAlreadyApplied(POSError):
+    """A request referred to an undo plan that was already published.
+
+    Raised when a retried/duplicate plan request is recognized instead
+    of flipping the affected objects a second time.  ``plan_id`` is the
+    plan identifier and ``tid`` is the transaction id in which the plan
+    was originally committed.
+    """
+
+    def __init__(self, plan_id, tid=None):
+        self.plan_id = plan_id
+        self.tid = tid
+
+    def __str__(self):
+        if self.tid is None:
+            return "Undo plan already applied"
+        return "Undo plan already applied in transaction %s" % (
+            readable_tid_repr(self.tid),)
+
+
 class StorageError(POSError):
     """Base class for storage based exceptions."""
 

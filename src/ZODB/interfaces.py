@@ -1059,6 +1059,37 @@ class IStorageUndoable(IStorage):
         """
         # Used by DB (Actually, by TransactionalUndo)
 
+    def undoMultiple(transaction_ids, transaction):
+        """Undo several transactions as one ordered, atomic undo plan.
+
+        This is an optional capability: not every undoable storage
+        provides it (callers should detect it with ``hasattr``).
+
+        ``transaction_ids`` is an ordered sequence of the opaque
+        transaction ids returned by ``undoInfo``/``undoLog``.  Every
+        target is validated before any undo data is written: a target
+        past a pack boundary, an object modified by a later
+        transaction that can't be resolved, a missing blob file, or an
+        uncertain storage response causes an
+        ``ZODB.POSException.UndoPlanError`` carrying per-target reason
+        codes, and no part of the plan becomes visible.
+
+        Object records, blob restorations and undo-plan metadata are
+        written into the current ``transaction``, so the plan is only
+        published if the subsequent ``tpc_vote``/``tpc_finish`` of the
+        whole transaction succeeds.  The metadata makes a committed
+        plan recognizable: a duplicate request for an already
+        published plan must not flip objects a second time.
+
+        Like ``undo``, this must only be called after ``tpc_begin``
+        and before ``tpc_vote``.  An empty sequence of targets is a
+        no-op.  Returns a triple ``(tid, oids, plan_info)`` where
+        ``tid`` is the serial of the current transaction, ``oids`` is
+        the sequence of affected object ids and ``plan_info`` is a
+        mapping with plan metadata (or None for an empty plan).
+        """
+        # Used by DB (Actually, by TransactionalUndo)
+
     def undoLog(first, last, filter=None):
         """Return a sequence of descriptions for undoable transactions.
 

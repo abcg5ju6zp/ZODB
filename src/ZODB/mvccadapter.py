@@ -299,6 +299,12 @@ class UndoAdapterInstance(Base):
             self._undone.update(result[1])
         return result
 
+    def undoMultiple(self, transaction_ids, transaction):
+        result = self._storage.undoMultiple(transaction_ids, transaction)
+        if result and result[1]:
+            self._undone.update(result[1])
+        return result
+
     def tpc_vote(self, transaction):
         result = self._storage.tpc_vote(transaction)
         if result:
@@ -310,4 +316,4 @@ class UndoAdapterInstance(Base):
             self._base._invalidate_finish(tid, self._undone, None)
             func(tid)
 
-        self._storage.tpc_finish(transaction, invalidate_finish)
+        return self._storage.tpc_finish(transaction, invalidate_finish)

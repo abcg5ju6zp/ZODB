@@ -5,7 +5,14 @@
 6.5 (unreleased)
 ================
 
-- Nothing changed yet.
+- Add atomic, ordered multi-transaction undo plans: ``DB.undoPlan`` and
+  the storage level ``undoMultiple`` validate every target (pack
+  boundary, object preconditions, blob files, storage availability)
+  before writing object records, blob restorations and plan metadata
+  into one transaction.  Failures are reported per target and nothing
+  becomes visible unless the whole plan finishes; retried or
+  reopened duplicate requests are recognized by the committed plan
+  metadata and do not flip objects a second time.
 
 
 6.4 (2026-10-12)

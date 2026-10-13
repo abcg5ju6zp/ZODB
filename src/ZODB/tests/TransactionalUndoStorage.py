@@ -28,8 +28,11 @@ from ZODB.tests.MinPO import MinPO
 from ZODB.tests.StorageTestBase import ZERO
 from ZODB.tests.StorageTestBase import zodb_pickle
 from ZODB.tests.StorageTestBase import zodb_unpickle
+from ZODB.utils import decode_tid
 from ZODB.utils import load_current
 from ZODB.utils import p64
+from ZODB.utils import UNDO_PLAN_EXT_KEY
+from ZODB.utils import UNDO_PLAN_ID_EXT_KEY
 
 
 class C(Persistent):
@@ -770,3 +773,250 @@ class TransactionalUndoStorage:
 
     def testUndoMultipleConflictResolutionReversed(self):
         self.testUndoMultipleConflictResolution(True)
+
+    # ------------------------------------------------------------------
+    # Ordered, atomic undo plans (storage.undoMultiple)
+    # ------------------------------------------------------------------
+
+    def _supports_undo_plan(self):
+        return hasattr(self._storage, 'undoMultiple')
+
+    def _apply_undo_plan(self, ids):
+        t = TransactionMetaData()
+        self._storage.tpc_begin(t)
+        try:
+            tid, oids, info = self._storage.undoMultiple(ids, t)
+            self._storage.tpc_vote(t)
+            tid = self._storage.tpc_finish(t)
+        except Exception:
+            self._storage.tpc_abort(t)
+            raise
+        return tid, oids, info
+
+    def testUndoPlanMultipleTargets(self):
+        if not self._supports_undo_plan():
+            return
+        eq = self.assertEqual
+        oid = self._storage.new_oid()
+        revid = self._dostore(oid, data=MinPO(10))
+        revid = self._dostore(oid, revid=revid, data=MinPO(11))
+        self._dostore(oid, revid=revid, data=MinPO(12))
+
+        info = self._storage.undoInfo()
+        ids = [info[0]['id'], info[1]['id']]
+        tid, oids, plan = self._apply_undo_plan(ids)
+        eq(plan['already_applied'], False)
+        self.assertIn(oid, oids)
+        data, revid = load_current(self._storage, oid)
+        eq(zodb_unpickle(data), MinPO(10))
+
+        # Plan metadata is recorded in the new transaction.
+        top = self._storage.undoLog(0, 1)[0]
+        eq(decode_tid(top['id']), tid)
+        eq(top[UNDO_PLAN_ID_EXT_KEY], plan['plan_id'])
+        eq(top[UNDO_PLAN_EXT_KEY],
+           [decode_tid(target) for target in ids])
+
+        # Duplicate of the plan is recognized at storage level and
+        # must not flip the object again.
+        t = TransactionMetaData()
+        self._storage.tpc_begin(t)
+        _, oids2, replay = self._storage.undoMultiple(ids, t)
+        self._storage.tpc_abort(t)
+        eq(replay['already_applied'], True)
+        eq(replay['tid'], tid)
+        eq(oids2, [])
+        data, revid = load_current(self._storage, oid)
+        eq(zodb_unpickle(data), MinPO(10))
+
+    def testUndoPlanEmptyTargets(self):
+        if not self._supports_undo_plan():
+            return
+        # Empty plans are a no-op (no metadata) and stay compatible.
+        t = TransactionMetaData()
+        self._storage.tpc_begin(t)
+        tid, oids, info = self._storage.undoMultiple([], t)
+        self._storage.tpc_vote(t)
+        self._storage.tpc_finish(t)
+        self.assertEqual(oids, [])
+        self.assertIsNone(info)
+        # Storage keeps working.
+        oid = self._storage.new_oid()
+        self._dostore(oid, data=MinPO(1))
+
+    def testUndoPlanSingleTargetCompatibility(self):
+        if not self._supports_undo_plan():
+            return
+        oid = self._storage.new_oid()
+        revid = self._dostore(oid, data=MinPO(1))
+        self._dostore(oid, revid=revid, data=MinPO(2))
+        target = self._storage.undoInfo(0, 1)[0]['id']
+        self._apply_undo_plan([target])
+        data, revid = load_current(self._storage, oid)
+        self.assertEqual(zodb_unpickle(data), MinPO(1))
+
+    def testUndoPlanConflictReasons(self):
+        if not self._supports_undo_plan():
+            return
+        oid = self._storage.new_oid()
+        revid = self._dostore(oid, data=MinPO(1))
+        revid_b = self._dostore(oid, revid=revid, data=MinPO(2))
+        self._dostore(oid, revid=revid_b, data=MinPO(3))
+        # Undoing the middle transaction is impossible: the object was
+        # modified later and MinPO can't resolve conflicts.
+        target = self._storage.undoInfo(0, 2)[1]['id']
+        t = TransactionMetaData()
+        self._storage.tpc_begin(t)
+        try:
+            with self.assertRaises(POSException.UndoPlanError) as cm:
+                self._storage.undoMultiple([target], t)
+            codes = [f['code'] for f in cm.exception.failures]
+            self.assertEqual(codes, ['conflict'])
+            self.assertEqual(cm.exception.failures[0]['oid'], oid)
+        finally:
+            self._storage.tpc_abort(t)
+        # Nothing was published: the object is still at revision 3.
+        data, revid = load_current(self._storage, oid)
+        self.assertEqual(zodb_unpickle(data), MinPO(3))
+        # And the storage accepts a normal transaction afterwards.
+        self._dostore(oid, revid=revid, data=MinPO(4))
+        data, revid = load_current(self._storage, oid)
+        self.assertEqual(zodb_unpickle(data), MinPO(4))
+
+    def testUndoPlanPackedReasons(self):
+        if not self._supports_undo_plan():
+            return
+        oid = b'\0' * 8
+        revid = self._dostore(oid, data=MinPO(50))
+        revid = self._dostore(oid, revid=revid, data=MinPO(51))
+        snooze()
+        packtime = time.time()
+        snooze()
+        revid = self._dostore(oid, revid=revid, data=MinPO(52))
+        self._dostore(oid, revid=revid, data=MinPO(53))
+        # Revisions 50/51 are about to be packed away.
+        packed_target = self._storage.undoInfo(0, 4)[2]['id']
+        valid_target = self._storage.undoInfo(0, 1)[0]['id']
+        self._storage.pack(packtime, referencesf)
+        t = TransactionMetaData()
+        self._storage.tpc_begin(t)
+        try:
+            with self.assertRaises(POSException.UndoPlanError) as cm:
+                # A malformed id and a packed target are both
+                # reported; the valid target in the same plan does
+                # not make any of it visible.
+                self._storage.undoMultiple(
+                    [b'aaaaaaaa', packed_target, valid_target], t)
+            codes = sorted(f['code'] for f in cm.exception.failures)
+            self.assertEqual(codes, ['packed', 'packed'])
+        finally:
+            self._storage.tpc_abort(t)
+        data, revid = load_current(self._storage, oid)
+        self.assertEqual(zodb_unpickle(data), MinPO(53))
+
+    def testUndoPlanFailureLeavesNoPartialState(self):
+        if not self._supports_undo_plan():
+            return
+        # Two independent objects: target one (oid1) is undoable,
+        # target two (oid2) is not.  The whole plan must be rejected
+        # and oid1's undo must not become visible.
+        oid1 = self._storage.new_oid()
+        oid2 = self._storage.new_oid()
+        t1 = TransactionMetaData()
+        self._storage.tpc_begin(t1)
+        self._storage.store(oid1, ZERO, zodb_pickle(MinPO(1)), '', t1)
+        self._storage.store(oid2, ZERO, zodb_pickle(MinPO(1)), '', t1)
+        self._storage.tpc_vote(t1)
+        self._storage.tpc_finish(t1)
+        t2 = TransactionMetaData()
+        self._storage.tpc_begin(t2)
+        self._storage.store(oid1, load_current(self._storage, oid1)[1],
+                            zodb_pickle(MinPO(2)), '', t2)
+        self._storage.tpc_vote(t2)
+        self._storage.tpc_finish(t2)
+        t3 = TransactionMetaData()
+        self._storage.tpc_begin(t3)
+        self._storage.store(oid2, load_current(self._storage, oid2)[1],
+                            zodb_pickle(MinPO(2)), '', t3)
+        self._storage.tpc_vote(t3)
+        self._storage.tpc_finish(t3)
+        t4 = TransactionMetaData()
+        self._storage.tpc_begin(t4)
+        self._storage.store(oid2, load_current(self._storage, oid2)[1],
+                            zodb_pickle(MinPO(3)), '', t4)
+        self._storage.tpc_vote(t4)
+        self._storage.tpc_finish(t4)
+
+        info = self._storage.undoInfo()
+        # Newest..oldest = t4, t3, t2, t1
+        t4_id = info[0]['id']
+        t3_id = info[1]['id']
+        t2_id = info[2]['id']
+        # Plan: undo t2 (oid1: 2->1, valid) and t3 (oid2: 3->2 while
+        # t4 changed it to 3 afterwards -> conflict for oid2).
+        t = TransactionMetaData()
+        self._storage.tpc_begin(t)
+        try:
+            with self.assertRaises(POSException.UndoPlanError) as cm:
+                self._storage.undoMultiple([t2_id, t3_id], t)
+            self.assertIn('conflict',
+                          [f['code'] for f in cm.exception.failures])
+        finally:
+            self._storage.tpc_abort(t)
+        data, _ = load_current(self._storage, oid1)
+        self.assertEqual(zodb_unpickle(data), MinPO(2))
+        data, _ = load_current(self._storage, oid2)
+        self.assertEqual(zodb_unpickle(data), MinPO(3))
+        # The newest transaction (t4) is still the newest transaction.
+        self.assertEqual(decode_tid(self._storage.undoLog(0, 1)[0]['id']),
+                         decode_tid(t4_id))
+
+    def testUndoPlanMissingBlobDirectStorage(self):
+        # Only runs for a FileStorage with blob_dir enabled directly
+        # (the BlobStorage wrapper has its own equivalent test).
+        if not self._supports_undo_plan():
+            return
+        if not getattr(self._storage, 'blob_dir', None):
+            return
+        import binascii
+        import os
+        from ZODB.blob import Blob
+        db = DB(self._storage)
+        cn = db.open()
+        try:
+            root = cn.root()
+            blob = Blob()
+            with blob.open('w') as f:
+                f.write(b'state 1')
+            root['blob'] = blob
+            transaction.commit()
+            blob = root['blob']
+            with blob.open('w') as f:
+                f.write(b'state 2')
+            transaction.commit()
+
+            mod_id = db.undoInfo(0, 1)[0]['id']
+            raw_mod_id = binascii.a2b_base64(
+                mod_id + b'\n' if isinstance(mod_id, bytes)
+                else (mod_id + '\n').encode())
+            oid = root['blob']._p_oid
+            _data, serial_before, _tid = self._storage.loadBefore(
+                oid, raw_mod_id)
+            source = self._storage.fshelper.getBlobFilename(
+                oid, serial_before)
+            self.assertTrue(os.path.exists(source))
+            os.remove(source)
+
+            with self.assertRaises(POSException.UndoPlanError) as cm:
+                db.undoPlan([mod_id])
+                transaction.commit()
+            transaction.abort()
+            self.assertEqual(
+                [f['code'] for f in cm.exception.failures],
+                ['missing-blob'])
+            cn.sync()
+            with root['blob'].open('r') as f:
+                self.assertEqual(f.read(), b'state 2')
+        finally:
+            cn.close()
+            db.close()

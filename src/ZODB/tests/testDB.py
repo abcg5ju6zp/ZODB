@@ -19,6 +19,7 @@ import transaction
 
 import ZODB
 import ZODB.tests.util
+from ZODB import POSException
 from ZODB.tests.MinPO import MinPO
 
 
@@ -203,6 +204,141 @@ class TransactionalUndoTests(unittest.TestCase):
             undo.tpc_finish(transaction.get())
         self.assertEqual(0, undo._db.storage.close_count)
         self.assertEqual(1, undo._db.storage.release_count)
+
+
+class UndoPlanTests(ZODB.tests.util.TestCase):
+
+    def setUp(self):
+        ZODB.tests.util.TestCase.setUp(self)
+        self.path = 'undo-plan.fs'
+        self.db = ZODB.DB(self.path)
+        self.conn = self.db.open()
+
+    def tearDown(self):
+        self.conn.close()
+        self.db.close()
+        ZODB.tests.util.TestCase.tearDown(self)
+
+    def _history(self, values):
+        root = self.conn.root()
+        for i, value in enumerate(values):
+            root['x'] = MinPO(value)
+            transaction.get().note('v%d' % value)
+            transaction.commit()
+
+    def _ids(self, first, last):
+        return [i['id'] for i in self.db.undoInfo(first, last)]
+
+    def testPlanAppliesAndReportsTid(self):
+        self._history([1, 2, 3])
+        ids = self._ids(0, 2)
+        handle = self.db.undoPlan(ids)
+        self.assertFalse(handle.already_applied)
+        transaction.get().note('plan')
+        transaction.commit()
+        self.conn.sync()
+        self.assertEqual(self.conn.root()['x'].value, 1)
+        tid = handle.tid
+        self.assertIsNotNone(tid)
+        # The same new tid is reported everywhere.
+        self.assertEqual(self.db.storage.lastTransaction(), tid)
+        top = self.db.undoLog(0, 1)[0]
+        from ZODB.utils import decode_tid
+        self.assertEqual(decode_tid(top['id']), tid)
+        # db.undoLog returns text descriptions.
+        self.assertEqual(top['description'], 'plan')
+
+    def testPlanInvalidatesOtherConnection(self):
+        self._history([1, 2, 3])
+        other = self.db.open()
+        self.assertEqual(other.root()['x'].value, 3)
+        ids = self._ids(0, 2)
+        self.db.undoPlan(ids)
+        transaction.commit()
+        other.sync()
+        # Cache of the other connection reflects the new state.
+        self.assertEqual(other.root()['x'].value, 1)
+        other.close()
+
+    def testDuplicatePlanIsNotAppliedAgain(self):
+        self._history([1, 2, 3])
+        ids = self._ids(0, 2)
+        handle = self.db.undoPlan(ids)
+        transaction.commit()
+        self.conn.sync()
+        original_tid = handle.tid
+        self.assertEqual(self.conn.root()['x'].value, 1)
+
+        handle2 = self.db.undoPlan(ids)
+        self.assertTrue(handle2.already_applied)
+        self.assertEqual(handle2.tid, original_tid)
+        # Committing joins nothing and does not change anything.
+        transaction.commit()
+        self.conn.sync()
+        self.assertEqual(self.conn.root()['x'].value, 1)
+        self.assertEqual(self.db.storage.lastTransaction(), original_tid)
+
+    def testDuplicatePlanRecognizedAfterReopen(self):
+        self._history([1, 2, 3])
+        ids = self._ids(0, 2)
+        handle = self.db.undoPlan(ids)
+        transaction.commit()
+        original_tid = handle.tid
+        self.conn.close()
+        self.db.close()
+
+        self.db = ZODB.DB(self.path)
+        self.conn = self.db.open()
+        self.assertEqual(self.conn.root()['x'].value, 1)
+        handle2 = self.db.undoPlan(ids)
+        self.assertTrue(handle2.already_applied)
+        self.assertEqual(handle2.tid, original_tid)
+        transaction.commit()
+        self.conn.sync()
+        self.assertEqual(self.conn.root()['x'].value, 1)
+        self.assertEqual(self.db.storage.lastTransaction(), original_tid)
+
+    def testUndoMultipleDuplicateIsSilentNoop(self):
+        self._history([1, 2])
+        ids = self._ids(0, 1)
+        self.db.undoMultiple(ids)
+        transaction.commit()
+        self.conn.sync()
+        self.assertEqual(self.conn.root()['x'].value, 1)
+        # Repeat: no exception, no second flip.
+        self.assertIsNone(self.db.undoMultiple(ids))
+        transaction.commit()
+        self.conn.sync()
+        self.assertEqual(self.conn.root()['x'].value, 1)
+
+    def testEmptyTargets(self):
+        self._history([1])
+        before = self.db.storage.lastTransaction()
+        # Historically an empty undo participates with an empty
+        # transaction; keep that working without errors.
+        self.db.undoMultiple([])
+        transaction.commit()
+        self.conn.sync()
+        self.assertEqual(self.conn.root()['x'].value, 1)
+        self.assertNotEqual(self.db.storage.lastTransaction(), before)
+
+    def testPerTargetFailureRejectsAndRecovers(self):
+        self._history([1, 2, 3])
+        # Undoing the v2 transaction while v3 is current conflicts.
+        bad = self.db.undoInfo(0, 3)[1]['id']
+        with self.assertRaises(POSException.UndoPlanError) as cm:
+            self.db.undoPlan([bad])
+            transaction.commit()
+        codes = [f['code'] for f in cm.exception.failures]
+        self.assertEqual(codes, ['conflict'])
+        transaction.abort()
+        self.conn.sync()
+        # Nothing partial is visible and the database keeps working.
+        self.assertEqual(self.conn.root()['x'].value, 3)
+        self.conn.root()['x'] = MinPO(4)
+        transaction.commit()
+        self.conn.sync()
+        self.assertEqual(self.conn.root()['x'].value, 4)
 
 
 def test_invalidateCache():

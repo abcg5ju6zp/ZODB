@@ -36,6 +36,9 @@ from ZODB._compat import PersistentUnpickler
 from ZODB._compat import ascii_bytes
 from ZODB.interfaces import BlobError
 from ZODB.POSException import POSKeyError
+from ZODB.POSException import UndoPlanError
+from ZODB.POSException import UNDO_TARGET_MISSING_BLOB
+from ZODB.POSException import UNDO_TARGET_STORAGE_ERROR
 
 
 logger = logging.getLogger('ZODB.blob')
@@ -856,41 +859,147 @@ class BlobStorage(BlobStorageMixin):
 
         # The serial_id is assumed to be given to us base-64 encoded
         # (belying the web UI legacy of the ZODB code :-()
-        serial_id = decodebytes(serial_id + b'\n')
-
+        raw_serial_id = decodebytes(serial_id + b'\n')
+        ops = self._undo_blob_restore_ops(raw_serial_id, undo_serial)
         with self._lock:
-            # we get all the blob oids on the filesystem related to the
-            # transaction we want to undo.
-            for oid in self.fshelper.getOIDsForSerial(serial_id):
-                # we want to find the serial id of the previous revision
-                # of this blob object.
-                load_result = self.loadBefore(oid, serial_id)
-
-                if load_result is None:
-
-                    # There was no previous revision of this blob
-                    # object.  The blob was created in the transaction
-                    # represented by serial_id.  We copy the blob data
-                    # to a new file that references the undo
-                    # transaction in case a user wishes to undo this
-                    # undo. It would be nice if we had some way to
-                    # link to old blobs.
-                    orig_fn = self.fshelper.getBlobFilename(oid, serial_id)
-                    new_fn = self.fshelper.getBlobFilename(oid, undo_serial)
-                else:
-                    # A previous revision of this blob existed before the
-                    # transaction implied by "serial_id".  We copy the blob
-                    # data to a new file that references the undo transaction
-                    # in case a user wishes to undo this undo.
-                    data, serial_before, serial_after = load_result
-                    orig_fn = self.fshelper.getBlobFilename(oid, serial_before)
-                    new_fn = self.fshelper.getBlobFilename(oid, undo_serial)
-                with open(orig_fn, "rb") as orig:
-                    with open(new_fn, "wb") as new:
-                        utils.cp(orig, new)
-                self.dirty_oids.append((oid, undo_serial))
+            self._undo_blob_restore(ops, undo_serial)
 
         return undo_serial, keys
+
+    def undoMultiple(self, serial_ids, transaction):
+        """Undo several transactions as one ordered, atomic undo plan.
+
+        Blob source files for every target are validated before the
+        underlying storage writes anything.  Object records, blob
+        restorations and plan metadata then share the storage's
+        current transaction, so the whole plan is published together
+        or rolled back together.
+        """
+        serial_ids = list(serial_ids or ())
+        if not serial_ids:
+            underlying = getattr(self.__storage, 'undoMultiple', None)
+            if underlying is not None:
+                return underlying(serial_ids, transaction)
+            return self._tid, [], None
+
+        undo_serial = self._tid
+
+        # Phase 1: validate blob restoration for every target before
+        # any object data is written.
+        ops_by_target = []
+        failures = []
+        for serial_id in serial_ids:
+            target_id = serial_id
+            if isinstance(target_id, str):
+                target_id = target_id.encode('ascii')
+            try:
+                raw_serial_id = decodebytes(target_id + b'\n')
+                ops = self._undo_blob_restore_ops(raw_serial_id, undo_serial)
+            except POSKeyError as exc:
+                failures.append(UndoPlanError.failure(
+                    target_id, UNDO_TARGET_MISSING_BLOB, str(exc)))
+                continue
+            except OSError as exc:
+                failures.append(UndoPlanError.failure(
+                    target_id, UNDO_TARGET_STORAGE_ERROR, str(exc)))
+                continue
+
+            missing = [op for op in ops if not os.path.exists(op[1])]
+            for oid, orig_fn, new_fn in missing:
+                failures.append(UndoPlanError.failure(
+                    target_id, UNDO_TARGET_MISSING_BLOB,
+                    "Blob file required to restore the previous object "
+                    "state is missing: %s" % orig_fn, oid))
+            if not missing:
+                ops_by_target.append(ops)
+
+        if failures:
+            raise UndoPlanError(failures)
+
+        # Phase 2: object records + plan metadata in the underlying
+        # storage's current transaction.
+        underlying = getattr(self.__storage, 'undoMultiple', None)
+        if underlying is not None:
+            undo_serial, keys, plan = underlying(serial_ids, transaction)
+            if plan and plan.get('already_applied'):
+                # Duplicate of an already published plan: nothing to
+                # restore, objects must not be flipped again.
+                return undo_serial, keys, plan
+        else:
+            # Legacy storage without a native batch undo: fall back to
+            # per-target undo() calls (still sharing one transaction).
+            plan = None
+            keys = []
+            for serial_id in serial_ids:
+                _, target_keys = self.__storage.undo(serial_id, transaction)
+                if target_keys:
+                    keys.extend(target_keys)
+            undo_serial = self._tid
+
+        # Phase 3: copy blob data in plan order (later copies win when
+        # several targets touch the same blob object).
+        with self._lock:
+            ops = []
+            for target_ops in ops_by_target:
+                ops.extend(target_ops)
+            try:
+                self._undo_blob_restore(ops, undo_serial)
+            except FileNotFoundError as exc:
+                # A source blob vanished between validation and
+                # application.
+                raise UndoPlanError([UndoPlanError.failure(
+                    None, UNDO_TARGET_MISSING_BLOB, str(exc))])
+            except OSError as exc:
+                raise UndoPlanError([UndoPlanError.failure(
+                    None, UNDO_TARGET_STORAGE_ERROR, str(exc))])
+
+        return undo_serial, keys, plan
+
+    def _undo_blob_restore_ops(self, serial_id, undo_serial):
+        """Compute ordered (oid, source, destination) blob restores.
+
+        ``serial_id`` is the raw (decoded) transaction id being undone.
+        """
+        ops = []
+        # we get all the blob oids on the filesystem related to the
+        # transaction we want to undo.
+        for oid in self.fshelper.getOIDsForSerial(serial_id):
+            # we want to find the serial id of the previous revision
+            # of this blob object.
+            load_result = self.loadBefore(oid, serial_id)
+
+            if load_result is None:
+
+                # There was no previous revision of this blob
+                # object.  The blob was created in the transaction
+                # represented by serial_id.  We copy the blob data
+                # to a new file that references the undo
+                # transaction in case a user wishes to undo this
+                # undo. It would be nice if we had some way to
+                # link to old blobs.
+                orig_fn = self.fshelper.getBlobFilename(oid, serial_id)
+                new_fn = self.fshelper.getBlobFilename(oid, undo_serial)
+            else:
+                # A previous revision of this blob existed before the
+                # transaction implied by "serial_id".  We copy the blob
+                # data to a new file that references the undo transaction
+                # in case a user wishes to undo this undo.
+                data, serial_before, serial_after = load_result
+                orig_fn = self.fshelper.getBlobFilename(oid, serial_before)
+                new_fn = self.fshelper.getBlobFilename(oid, undo_serial)
+            ops.append((oid, orig_fn, new_fn))
+        return ops
+
+    def _undo_blob_restore(self, ops, undo_serial):
+        dirty = set(self.dirty_oids)
+        for oid, orig_fn, new_fn in ops:
+            with open(orig_fn, "rb") as orig:
+                with open(new_fn, "wb") as new:
+                    utils.cp(orig, new)
+            entry = (oid, undo_serial)
+            if entry not in dirty:
+                self.dirty_oids.append(entry)
+                dirty.add(entry)
 
     def new_instance(self):
         """Implementation of IMVCCStorage.new_instance.

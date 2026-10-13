@@ -33,6 +33,7 @@ from zope.interface import implementer
 from ZODB._compat import FILESTORAGE_MAGIC
 from ZODB._compat import Pickler
 from ZODB._compat import _protocol
+from ZODB._compat import dumps
 from ZODB._compat import loads
 from ZODB.BaseStorage import BaseStorage
 from ZODB.BaseStorage import DataRecord as _DataRecord
@@ -68,6 +69,11 @@ from ZODB.POSException import StorageError
 from ZODB.POSException import StorageSystemError
 from ZODB.POSException import StorageTransactionError
 from ZODB.POSException import UndoError
+from ZODB.POSException import UndoPlanError
+from ZODB.POSException import UNDO_TARGET_CONFLICT
+from ZODB.POSException import UNDO_TARGET_MISSING_BLOB
+from ZODB.POSException import UNDO_TARGET_PACKED
+from ZODB.POSException import UNDO_TARGET_STORAGE_ERROR
 from ZODB.utils import as_bytes
 from ZODB.utils import as_text
 from ZODB.utils import cp
@@ -75,6 +81,9 @@ from ZODB.utils import load_current
 from ZODB.utils import mktemp
 from ZODB.utils import p64
 from ZODB.utils import u64
+from ZODB.utils import UNDO_PLAN_EXT_KEY
+from ZODB.utils import UNDO_PLAN_ID_EXT_KEY
+from ZODB.utils import undo_plan_id
 from ZODB.utils import z64
 
 from .. import utils
@@ -91,6 +100,73 @@ logger = logging.getLogger('ZODB.FileStorage')
 def panic(message, *data):
     logger.critical(message, *data)
     raise CorruptedTransactionError(message % data)
+
+
+# Reasons used while validating/applying ordered undo plans.
+_UNDO_MISSING_BLOB_REASON = (
+    "Blob file required to restore the previous object state is missing")
+
+# UndoError reasons that indicate a pack boundary / invalid target.
+_UNDO_PACKED_REASONS = ("Invalid transaction id",
+                        "non-undoable transaction")
+
+# How many already published undo plans are remembered in-process for
+# instant duplicate recognition.  Older plans are still recognized by
+# scanning the transaction log, this only bounds memory usage.
+_UNDO_PLAN_CACHE_SIZE = 1000
+
+
+class _UndoTargetFailed(Exception):
+    """Internal: one target of an undo plan failed validation/application.
+
+    Carries a list of per-target failure mappings as produced by
+    ``_undo_plan_failure``.  Never escapes the storage implementation.
+    """
+
+    def __init__(self, failures):
+        self.failures = failures
+
+
+def _undo_plan_failure(target, code, reason, oid=None):
+    return {'target': target, 'code': code, 'reason': reason, 'oid': oid}
+
+
+def _classify_undo_failure(target, exc):
+    """Turn an exception from undoing one target into failure mappings."""
+    if isinstance(exc, MultipleUndoErrors):
+        # MultipleUndoErrors._errs holds (oid, original exception)
+        # pairs (the second member is used as the printable reason).
+        results = []
+        for oid, undo_exc in exc._errs:
+            reason = getattr(undo_exc, '_reason', None)
+            if reason is None:
+                reason = str(undo_exc)
+            results.append(_undo_plan_failure(
+                target, _classify_undo_reason(reason, undo_exc),
+                reason, oid))
+        return results
+    oid = getattr(exc, '_oid', None)
+    reason = getattr(exc, '_reason', None)
+    if reason is None:
+        reason = str(exc) or exc.__class__.__name__
+    return [_undo_plan_failure(target, _classify_undo_reason(reason, exc),
+                               reason, oid)]
+
+
+def _classify_undo_reason(reason, exc=None):
+    if reason in _UNDO_PACKED_REASONS:
+        return UNDO_TARGET_PACKED
+    if reason == _UNDO_MISSING_BLOB_REASON:
+        return UNDO_TARGET_MISSING_BLOB
+    if isinstance(exc, POSKeyError):
+        return UNDO_TARGET_MISSING_BLOB
+    if exc is None or isinstance(exc, UndoError):
+        # Plain undo failures (single or collected in
+        # MultipleUndoErrors) are object precondition/conflict
+        # failures.
+        return UNDO_TARGET_CONFLICT
+    # File errors, corrupted data and uncertain storage responses.
+    return UNDO_TARGET_STORAGE_ERROR
 
 
 class FileStorageError(StorageError):
@@ -334,6 +410,15 @@ class FileStorage(
                        file_name, seconds)
 
         self._quota = quota
+
+        # Ordered undo-plan bookkeeping: plans committed by this
+        # process are remembered for instant duplicate recognition;
+        # plans committed by earlier processes are found by scanning
+        # the transaction log.  ``_undo_plan_committing`` is the plan
+        # id of the plan in the currently committing transaction, if
+        # any.
+        self._committed_undo_plans = {}
+        self._undo_plan_committing = None
 
         if blob_dir:
             self.blob_dir = os.path.abspath(blob_dir)
@@ -874,6 +959,10 @@ class FileStorage(
         self._pos = self._nextpos
         self._index.update(self._tindex)
         self._ltid = tid
+        if self._undo_plan_committing is not None:
+            self._remember_committed_undo_plan(
+                self._undo_plan_committing, tid)
+            self._undo_plan_committing = None
         self._blob_tpc_finish()
 
     def _abort(self):
@@ -882,6 +971,7 @@ class FileStorage(
             self._files.flush()
             self._nextpos = 0
             self._blob_tpc_abort()
+        self._undo_plan_committing = None
 
     def _undoDataInfo(self, oid, pos, tpos):
         """Return the tid, data pointer, and data for the oid record at pos
@@ -1067,6 +1157,255 @@ class FileStorage(
             self._tindex.update(tindex)
             return self._tid, tindex.keys()
 
+    def undoMultiple(self, transaction_ids, transaction):
+        """Undo several transactions as a single ordered undo plan.
+
+        All targets are validated, in the given order, before any undo
+        data is written.  Object records, blob restorations and undo
+        plan metadata are written into the current (already begun)
+        transaction; the plan is only published when the transaction
+        later votes and finishes.  Per-target failures are reported as
+        :class:`~ZODB.POSException.UndoPlanError` and leave nothing
+        visible to other connections.
+
+        Returns ``(tid, oids, plan_info)``.  An empty target sequence
+        is a no-op and returns ``(self._tid, [], None)``.
+        """
+        if self._is_read_only:
+            raise ReadOnlyError()
+        if transaction is not self._transaction:
+            raise StorageTransactionError(self, transaction)
+
+        if transaction_ids is None:
+            transaction_ids = ()
+        targets = list(transaction_ids)
+        if not targets:
+            # Compatibility: an empty undo writes nothing and no
+            # metadata, just like an empty sequence of undo() calls.
+            return self._tid, [], None
+
+        with self._lock:
+            # Phase 0: decode the opaque undo ids.  A malformed or
+            # packed-away id is a per-target failure, never a partial
+            # write.
+            target_ids = []
+            target_tids = []
+            failures = []
+            for target in targets:
+                target_id = target
+                if isinstance(target_id, str):
+                    target_id = target_id.encode('ascii')
+                try:
+                    tid = decodebytes(target_id + b'\n')
+                except (binascii.Error, ValueError):
+                    failures.append(_undo_plan_failure(
+                        target_id, UNDO_TARGET_PACKED,
+                        "Invalid transaction id"))
+                    continue
+                if len(tid) != 8:
+                    failures.append(_undo_plan_failure(
+                        target_id, UNDO_TARGET_PACKED,
+                        "Invalid transaction id"))
+                    continue
+                target_ids.append(target_id)
+                target_tids.append(tid)
+
+            plan_id = undo_plan_id(target_tids)
+
+            # Duplicate recognition: a retried request (lost response,
+            # process restart) for an already published plan must not
+            # flip objects a second time.
+            committed_tid = self._committed_undo_plans.get(plan_id)
+            if committed_tid is None and not failures:
+                committed_tid = self._find_committed_undo_plan(plan_id)
+            if committed_tid is not None:
+                return committed_tid, [], {
+                    'plan_id': plan_id,
+                    'targets': target_tids,
+                    'already_applied': True,
+                    'tid': committed_tid,
+                }
+
+            # Locate each target transaction record.  This is
+            # independent per target, so collect every missing/packed
+            # or unreadable target instead of stopping at the first.
+            located = []
+            for target_id, tid in zip(target_ids, target_tids):
+                try:
+                    tpos = self._txn_find(tid, 1)
+                except UndoError as exc:
+                    failures.extend(_classify_undo_failure(target_id, exc))
+                    tpos = None
+                except (OSError, StorageSystemError, FileStorageError) as exc:
+                    failures.append(_undo_plan_failure(
+                        target_id, UNDO_TARGET_STORAGE_ERROR,
+                        str(exc) or exc.__class__.__name__))
+                    tpos = None
+                located.append((target_id, tid, tpos))
+
+            # Phase 1: validate every target in plan order by running
+            # the real write logic as a dry run.  Simulated writes of
+            # earlier targets are kept so later targets see the exact
+            # state the real application would produce (this is what
+            # makes undoing several transactions touching the same
+            # object work).
+            plan_start = self._undo_plan_checkpoint()
+            # Conflict resolution during the dry run must not leak
+            # into the resolved-oids list reported by tpc_vote.
+            resolved_start = list(self._resolved)
+            for target_id, tid, tpos in located:
+                if tpos is None:
+                    continue
+                mark = self._undo_plan_checkpoint()
+                try:
+                    tindex = self._txn_undo_write(tpos, dry_run=True)
+                except UndoError as exc:
+                    failures.extend(_classify_undo_failure(
+                        target_id, exc))
+                    self._undo_plan_restore(mark)
+                    continue
+                except (OSError, StorageSystemError,
+                        FileStorageError) as exc:
+                    # File error or uncertain storage response.
+                    failures.append(_undo_plan_failure(
+                        target_id, UNDO_TARGET_STORAGE_ERROR,
+                        str(exc) or exc.__class__.__name__))
+                    self._undo_plan_restore(mark)
+                    continue
+                self._tindex.update(tindex)
+
+            # Discard the whole dry run before deciding.
+            self._undo_plan_restore(plan_start)
+            self._resolved[:] = resolved_start
+
+            if failures:
+                # Nothing was written: this is a clean validation
+                # rejection and the caller aborts the transaction.
+                raise UndoPlanError(failures)
+
+            # Phase 2: all targets are undoable.  Record the plan
+            # metadata in the transaction extension.  That requires a
+            # still-empty transaction buffer, because the metadata
+            # changes the transaction header length.
+            if self._tfile.tell() or self._tindex:
+                raise StorageTransactionError(
+                    "An undo plan must be applied in a transaction with "
+                    "no other writes")
+            self._set_undo_plan_extension(plan_id, target_tids)
+
+            # Phase 3: write object records and restore blobs for real.
+            # Any error here rolls back the entire plan; the transaction
+            # manager's tpc_abort cleans the rest, so no partial undo can
+            # become visible.
+            self._undo_plan_committing = plan_id
+            oids = set()
+            try:
+                for target_id, tid, tpos in located:
+                    try:
+                        tindex = self._txn_undo_write(tpos)
+                    except UndoError as exc:
+                        target_failures = _classify_undo_failure(
+                            target_id, exc)
+                        raise _UndoTargetFailed(target_failures)
+                    except POSKeyError as exc:
+                        # A blob file disappeared between validation
+                        # and application.
+                        raise _UndoTargetFailed([_undo_plan_failure(
+                            target_id, UNDO_TARGET_MISSING_BLOB, str(exc))])
+                    except (OSError, StorageSystemError,
+                            FileStorageError) as exc:
+                        raise _UndoTargetFailed([_undo_plan_failure(
+                            target_id, UNDO_TARGET_STORAGE_ERROR,
+                            str(exc) or exc.__class__.__name__)])
+                    self._tindex.update(tindex)
+                    oids.update(tindex)
+            except _UndoTargetFailed as exc:
+                self._rollback_undo_plan()
+                raise UndoPlanError(exc.failures)
+            except BaseException:
+                self._rollback_undo_plan()
+                raise
+
+            return self._tid, sorted(oids), {
+                'plan_id': plan_id,
+                'targets': target_tids,
+                'already_applied': False,
+            }
+
+    def _undo_plan_checkpoint(self):
+        """Return a checkpoint of the in-progress transaction state."""
+        return self._tfile.tell(), dict(self._tindex)
+
+    def _undo_plan_restore(self, checkpoint):
+        """Truncate the temp transaction back to a checkpoint."""
+        pos, tindex = checkpoint
+        self._tfile.seek(pos)
+        self._tfile.truncate(pos)
+        self._tindex.clear()
+        self._tindex.update(tindex)
+
+    def _rollback_undo_plan(self):
+        """Remove all plan writes, including copied blob files."""
+        self._undo_plan_restore((0, {}))
+        self._undo_plan_committing = None
+        # Blob files copied during the failed plan are tracked as dirty
+        # and removed again.
+        self._blob_tpc_abort()
+
+    def _set_undo_plan_extension(self, plan_id, target_tids):
+        u, d, ext_bytes = self._ude
+        ext = loads(ext_bytes) if ext_bytes else {}
+        ext[UNDO_PLAN_ID_EXT_KEY] = plan_id
+        ext[UNDO_PLAN_EXT_KEY] = list(target_tids)
+        ext_bytes = dumps(ext, _protocol)
+        if len(ext_bytes) > 65535:
+            raise FileStorageError('too much extension data')
+        self._ude = u, d, ext_bytes
+        # Recompute the transaction header length, mirroring
+        # FileStorage._begin().  The temp transaction is guaranteed to
+        # be empty at this point.
+        self._thl = TRANS_HDR_LEN + len(u) + len(d) + len(ext_bytes)
+
+    def _remember_committed_undo_plan(self, plan_id, tid):
+        cache = self._committed_undo_plans
+        cache[plan_id] = tid
+        if len(cache) > _UNDO_PLAN_CACHE_SIZE:
+            cache.pop(next(iter(cache)))
+
+    def _find_committed_undo_plan(self, plan_id):
+        """Search committed transaction metadata for a published plan.
+
+        Scans backwards through the transaction log up to the pack
+        boundary, holding the storage lock.  Returns the undo
+        transaction's tid or None.
+        """
+        pos = self._pos
+        try:
+            while pos > 39:
+                self._file.seek(pos - 8)
+                pos = pos - u64(self._file.read(8)) - 8
+                self._file.seek(pos)
+                h = self._file.read(TRANS_HDR_LEN)
+                tid, tl, status, ul, dl, el = unpack(TRANS_HDR, h)
+                status = as_text(status)
+                if status == 'p':
+                    break
+                if status != ' ' or not el:
+                    continue
+                self._file.read(ul + dl)
+                try:
+                    ext = loads(self._file.read(el))
+                except Exception:  # corrupt/unknown ext: ignore, keep scan
+                    continue
+                if ext.get(UNDO_PLAN_ID_EXT_KEY) == plan_id:
+                    return tid
+        except OSError:
+            # Uncertain storage response while scanning: do not claim a
+            # duplicate; the regular 2PC flow remains safe.
+            logger.debug("Undo plan lookup hit a storage error",
+                         exc_info=True)
+        return None
+
     def _txn_find(self, tid, stop_at_pack):
         pos = self._pos
         while pos > 39:
@@ -1083,8 +1422,14 @@ class FileStorage(
                     break
         raise UndoError("Invalid transaction id")
 
-    def _txn_undo_write(self, tpos):
+    def _txn_undo_write(self, tpos, dry_run=False):
         # a helper function to write the data records for transactional undo
+        #
+        # When ``dry_run`` is true, the data records and index updates
+        # are simulated for undo-plan validation but blob data is only
+        # checked for presence, never copied. The caller is responsible
+        # for removing the simulated records again (see
+        # ``_undo_plan_restore``) before doing the real write.
 
         otloc = self._pos
         here = self._pos + self._tfile.tell() + self._thl
@@ -1122,14 +1467,26 @@ class FileStorage(
                         pass  # It was removed, so no need to copy data
                     else:
                         if self.is_blob_record(up):
-                            # We're undoing a blob modification operation.
-                            # We have to copy the blob data
-                            tmp = mktemp(dir=self.fshelper.temp_dir)
-                            with self.openCommittedBlobFile(
-                                    h.oid, userial) as sfp:
-                                with open(tmp, 'wb') as dfp:
-                                    cp(sfp, dfp)
-                            self._blob_storeblob(h.oid, self._tid, tmp)
+                            # We're undoing a blob modification
+                            # operation.  We have to copy the blob data.
+                            blob_filename = self.fshelper.getBlobFilename(
+                                h.oid, userial)
+                            if dry_run:
+                                # Validate up front, while nothing has
+                                # been published, that the blob file we
+                                # would restore still exists.  The data
+                                # record itself is still simulated
+                                # below.
+                                if not os.path.exists(blob_filename):
+                                    raise UndoError(
+                                        _UNDO_MISSING_BLOB_REASON, h.oid)
+                            else:
+                                tmp = mktemp(dir=self.fshelper.temp_dir)
+                                with self.openCommittedBlobFile(
+                                        h.oid, userial) as sfp:
+                                    with open(tmp, 'wb') as dfp:
+                                        cp(sfp, dfp)
+                                self._blob_storeblob(h.oid, self._tid, tmp)
 
                 new = DataHeader(h.oid, self._tid, ipos, otloc, 0, len(p))
 

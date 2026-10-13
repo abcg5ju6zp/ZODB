@@ -12,11 +12,14 @@
 #
 ##############################################################################
 
+import hashlib
 import os
 import struct
 import sys
 import threading
 import time
+from base64 import decodebytes
+from base64 import encodebytes
 from binascii import hexlify
 from binascii import unhexlify
 from io import BytesIO
@@ -41,7 +44,22 @@ __all__ = ['z64',
            'readable_tid_repr',
            'get_pickle_metadata',
            'locked',
+           'UNDO_PLAN_EXT_KEY',
+           'UNDO_PLAN_ID_EXT_KEY',
+           'undo_plan_id',
+           'encode_tid',
+           'decode_tid',
            ]
+
+# Extension-data keys under which an ordered undo plan records its
+# metadata.  UNDO_PLAN_EXT_KEY holds the ordered sequence of raw target
+# tids undone by the transaction; UNDO_PLAN_ID_EXT_KEY holds the stable
+# plan identifier.  Because the data lands in a transaction's extension
+# record, it is visible through undoLog()/undoInfo() and survives
+# storage reopen, which lets duplicate (e.g. retried) requests be
+# recognized instead of flipping the affected objects a second time.
+UNDO_PLAN_EXT_KEY = 'zodb.undo_plan'
+UNDO_PLAN_ID_EXT_KEY = 'zodb.undo_plan_id'
 
 
 def as_bytes(obj):
@@ -93,6 +111,38 @@ def u64(v):
 
 
 U64 = u64
+
+
+def encode_tid(tid):
+    """Encode a raw 8-byte transaction id as the opaque undo id.
+
+    The opaque ids returned by ``undoLog()``/``undoInfo()`` are
+    base-64 encoded transaction tids.
+    """
+    return encodebytes(tid).rstrip()
+
+
+def decode_tid(undo_id):
+    """Decode an opaque undo id back into the raw 8-byte transaction id."""
+    if isinstance(undo_id, str):
+        undo_id = undo_id.encode('ascii')
+    return decodebytes(undo_id + b'\n')
+
+
+def undo_plan_id(target_tids):
+    """Return a stable identifier for an *ordered* undo plan.
+
+    ``target_tids`` is an ordered iterable of raw 8-byte transaction
+    tids.  The identifier depends on the targets *and* their order:
+    the same set of transactions undone in a different order is a
+    different plan with different resulting object states.
+    """
+    digest = hashlib.sha256()
+    for tid in target_tids:
+        if len(tid) != 8:
+            raise ValueError("Undo plan targets must be 8-byte tids")
+        digest.update(tid)
+    return digest.digest()
 
 
 def cp(f1, f2, length=None, bufsize=64 * 1024):

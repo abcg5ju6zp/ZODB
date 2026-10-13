@@ -35,6 +35,7 @@ from ZODB.Connection import TransactionMetaData
 from ZODB.Connection import noop
 from ZODB.interfaces import IDatabase
 from ZODB.interfaces import IMVCCStorage
+from ZODB.POSException import UndoPlanAlreadyApplied
 from ZODB.utils import z64
 
 
@@ -945,6 +946,68 @@ class DB:
             return ()
         return _text_transaction_info(self.storage.undoInfo(*args, **kw))
 
+    def _undoPlanId(self, ids):
+        """Compute the stable id of an ordered sequence of undo ids."""
+        return utils.undo_plan_id(
+            [utils.decode_tid(target) for target in ids])
+
+    def _findCommittedUndoPlan(self, plan_id):
+        """Return the tid of an already published undo plan, else None.
+
+        Plan metadata is stored in the committing transaction's
+        extension data, so it is visible through undoInfo() and
+        survives storage reopen.  This lets a retried request (lost
+        response, process restart) be recognized instead of flipping
+        the affected objects a second time.
+        """
+        first = 0
+        batch = 100
+        while True:
+            infos = self.storage.undoInfo(first, first + batch)
+            if not infos:
+                return None
+            for info in infos:
+                if info.get(utils.UNDO_PLAN_ID_EXT_KEY) == plan_id:
+                    return utils.decode_tid(info['id'])
+            if len(infos) < batch:
+                return None
+            first += batch
+
+    def undoPlan(self, ids, txn=None):
+        """Undo multiple transactions as one ordered, atomic undo plan.
+
+        Unlike :meth:`undoMultiple`, this returns an
+        :class:`UndoPlanHandle` describing the plan.  If the same plan
+        (same targets in the same order) was already published, no
+        transaction is joined and the handle reports
+        ``already_applied`` with the original tid, so objects are not
+        flipped again.
+
+        :Parameters:
+          - `ids`: an ordered sequence of storage-specific transaction
+            identifiers as returned by :meth:`undoLog`/:meth:`undoInfo`
+          - `txn`: transaction context to use.  By default, uses the
+            current transaction.
+        """
+        if not self.supportsUndo():
+            raise NotImplementedError
+        if txn is None:
+            txn = transaction.get()
+        if isinstance(ids, (str, bytes)):
+            ids = [ids]
+        else:
+            ids = list(ids)
+
+        plan_id = self._undoPlanId(ids) if ids else None
+        if ids:
+            already_tid = self._findCommittedUndoPlan(plan_id)
+            if already_tid is not None:
+                return UndoPlanHandle(plan_id, already_tid, True)
+
+        datamanager = TransactionalUndo(self, ids, plan_id)
+        txn.join(datamanager)
+        return UndoPlanHandle(plan_id, None, False, datamanager)
+
     def undoMultiple(self, ids, txn=None):
         """Undo multiple transactions identified by ids.
 
@@ -957,6 +1020,13 @@ class DB:
         or undoInfo().  The value of ids are not the same as a
         transaction ids used by other methods; they are unique to undo().
 
+        The ids are applied as an ordered undo plan: when the storage
+        supports atomic multi-transaction undo, all targets are
+        validated before any data is written and the whole plan shares
+        one transaction.  A duplicate request for a plan already
+        published (e.g. retried after a lost response) is recognized
+        instead of flipping objects again.
+
         :Parameters:
           - `ids`: a sequence of storage-specific transaction identifiers
           - `txn`: transaction context to use for undo().
@@ -968,7 +1038,18 @@ class DB:
             txn = transaction.get()
         if isinstance(ids, str):
             ids = [ids]
-        txn.join(TransactionalUndo(self, ids))
+        else:
+            ids = list(ids)
+
+        if ids:
+            plan_id = self._undoPlanId(ids)
+            if self._findCommittedUndoPlan(plan_id) is not None:
+                # Already published; joining nothing means the objects
+                # aren't undone a second time.
+                return None
+        else:
+            plan_id = None
+        txn.join(TransactionalUndo(self, ids, plan_id))
 
     def undo(self, id, txn=None):
         """Undo a transaction identified by id.
@@ -1047,12 +1128,52 @@ resource_counter_lock = utils.Lock()
 resource_counter = 0
 
 
+class UndoPlanHandle:
+    """Handle describing an ordered undo plan joined to a transaction.
+
+    ``plan_id`` identifies the ordered set of targets.  After the
+    surrounding transaction commits, ``tid`` is the new transaction
+    id (the same id used for invalidations and shown by
+    undoLog/undoInfo) and ``oids`` are the affected objects.  Handles
+    returned for an already published plan have ``already_applied``
+    true and carry the original ``tid``.
+    """
+
+    def __init__(self, plan_id, tid, already_applied, datamanager=None):
+        self.plan_id = plan_id
+        self.already_applied = already_applied
+        self._tid = tid
+        self._datamanager = datamanager
+
+    @property
+    def tid(self):
+        if self._tid is not None:
+            return self._tid
+        if self._datamanager is not None:
+            return self._datamanager.plan_tid
+        return None
+
+    @property
+    def oids(self):
+        if self._datamanager is not None:
+            return self._datamanager.plan_oids
+        return ()
+
+    def __repr__(self):
+        state = 'applied' if self.already_applied else 'pending'
+        return "<UndoPlanHandle %s plan_id=%r>" % (state, self.plan_id)
+
+
 class TransactionalUndo:
 
-    def __init__(self, db, tids):
+    def __init__(self, db, tids, plan_id=None):
         self._db = db
         self._tids = tids
         self._storage = None
+        self.plan_id = plan_id
+        self.plan_tid = None
+        self.plan_oids = ()
+        self.already_applied = False
 
     def abort(self, transaction):
         pass
@@ -1093,23 +1214,60 @@ class TransactionalUndo:
 
     def commit(self, transaction):
         transaction = transaction.data(self)
-        for tid in self._tids:
-            self._storage.undo(tid, transaction)
+        storage = self._storage
+        batch_undo = getattr(storage, 'undoMultiple', None)
+        if self._tids and batch_undo is not None:
+            # Atomic ordered plan: the storage validates every target
+            # before writing object records, blob restorations and plan
+            # metadata into this same transaction.
+            tid, oids, info = batch_undo(self._tids, transaction)
+            self.plan_oids = tuple(oids or ())
+            if info and info.get('already_applied'):
+                # The storage recognized an already published plan
+                # (e.g. a duplicate concurrent request).  Nothing was
+                # written; abort the otherwise empty storage
+                # transaction so no marker record is published.  The
+                # transaction manager's later tpc_abort call is then a
+                # no-op.
+                self.already_applied = True
+                self.plan_tid = info.get('tid') or tid
+                storage.tpc_abort(transaction)
+                self.close()
+                raise UndoPlanAlreadyApplied(self.plan_id, self.plan_tid)
+        else:
+            # Storage without a native batch undo (or an empty plan):
+            # keep the traditional per-target calls, still within one
+            # transaction.
+            oids = set()
+            for tid in self._tids:
+                result = storage.undo(tid, transaction)
+                if result and result[1]:
+                    oids.update(result[1])
+            self.plan_oids = tuple(oids)
 
     def tpc_vote(self, transaction):
+        if self._storage is None:
+            return
         transaction = transaction.data(self)
         self._storage.tpc_vote(transaction)
 
     def tpc_finish(self, transaction):
         try:
             transaction = transaction.data(self)
-            self._storage.tpc_finish(transaction)
+            self.plan_tid = self._storage.tpc_finish(transaction)
         finally:
             self.close()
 
     def tpc_abort(self, transaction):
+        if self._storage is None:
+            # Already released (e.g. a duplicate plan self-aborted
+            # from commit()).
+            return
         try:
-            transaction = transaction.data(self)
+            try:
+                transaction = transaction.data(self)
+            except KeyError:
+                return
             self._storage.tpc_abort(transaction)
         finally:
             self.close()
