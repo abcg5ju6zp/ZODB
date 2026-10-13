@@ -426,6 +426,9 @@ class DemoStorage(ConflictResolvingStorage):
                 "Unexpected resolved conflicts")
         return self._resolved
 
+    def tpc_tid(self, transaction):
+        return self.changes.tpc_tid(transaction)
+
     def tpc_finish(self, transaction, func=lambda tid: None):
         with self._lock:
             if (transaction is not self._transaction):

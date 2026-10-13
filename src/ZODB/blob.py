@@ -35,7 +35,9 @@ from ZODB import utils
 from ZODB._compat import PersistentUnpickler
 from ZODB._compat import ascii_bytes
 from ZODB.interfaces import BlobError
+from ZODB.mvccadapter import TXN_STATE_ATTR
 from ZODB.POSException import POSKeyError
+from ZODB.POSException import Unsupported
 
 
 logger = logging.getLogger('ZODB.blob')
@@ -654,11 +656,53 @@ class BlobStorageMixin:
         self.fshelper = NoBlobsFileSystemHelper()
         self.dirty_oids = []
 
-    def _blob_tpc_abort(self):
+    def _blob_revision_committed(self, oid, serial, transaction=None):
+        """Check storage facts: is blob revision (oid, serial) published?
+
+        Used before removing a staged blob file: when tpc_finish
+        failed after the storage committed (or its answer was lost),
+        the following tpc_abort must not delete a blob whose data
+        revision is already published.
+        """
+        if transaction is not None:
+            state = getattr(transaction, TXN_STATE_ATTR, None)
+            if state is not None and state.is_committed():
+                return True
+        try:
+            self.loadSerial(oid, serial)
+        except POSKeyError:
+            return False
+        except AttributeError:
+            # Storage cannot produce revisions: it cannot prove the
+            # file is stale either, keep it.
+            return True
+        except Unsupported:
+            return True
+        except Exception:
+            # Storage unreachable after an uncertain finish.  Keeping a
+            # possibly-staged file can never corrupt published data;
+            # deleting a published blob would.
+            logger.critical(
+                "Cannot verify blob revision %s/%s against the storage; "
+                "keeping the file",
+                utils.oid_repr(oid), utils.tid_repr(serial), exc_info=True)
+            return True
+        return True
+
+    def _blob_tpc_abort(self, transaction=None):
         """Blob cleanup to be called from subclass tpc_abort
+
+        Files are removed only when the storage confirms that their
+        revision was never committed, so an abort that follows an
+        uncertain-but-successful tpc_finish cannot half-delete a
+        published blob.
         """
         while self.dirty_oids:
             oid, serial = self.dirty_oids.pop()
+            if self._blob_revision_committed(oid, serial, transaction):
+                # Published by the storage (possibly recovered after a
+                # lost finish response): leave the file in place.
+                continue
             clean = self.fshelper.getBlobFilename(oid, serial)
             if os.path.exists(clean):
                 remove_committed(clean)
@@ -667,6 +711,15 @@ class BlobStorageMixin:
         """Blob cleanup to be called from subclass tpc_finish
         """
         self.dirty_oids = []
+
+    def tpc_recovered(self, transaction, tid):
+        """Hook called when a failed tpc_finish is recovered as committed.
+
+        The blob files were staged at the committed path (under the
+        storage-allocated tid) before vote; all that remains is to drop
+        the dirty-oid bookkeeping.
+        """
+        self._blob_tpc_finish()
 
     def registerDB(self, db):
         self.__untransform_record_data = db.untransform_record_data
@@ -757,6 +810,54 @@ class BlobStorage(BlobStorageMixin):
                 ZODB.interfaces.IBlobStorageRestoreable,
                 zope.interface.providedBy(storage))
 
+        # Reconcile blob files with storage facts after an unclean
+        # shutdown / storage reopen: when the underlying storage dropped
+        # a trailing, not-yet-committed transaction, its staged blob
+        # files (already at committed-layout paths) must not remain
+        # visible.
+        if getattr(storage, '_recovered_incomplete', False):
+            self._blob_recover_uncommitted()
+
+    def _blob_recover_uncommitted(self):
+        """Remove committed-layout blob files that have no storage revision.
+
+        A crash between blob staging and storage publish (or a storage
+        recovery that truncates the trailing, not-yet-committed
+        transaction) can leave a blob file at a committed path without
+        a matching object revision.  Decide purely from storage facts
+        and only remove what the storage proves absent.
+        """
+        try:
+            oid_paths = list(self.fshelper.listOIDs())
+        except (AttributeError, OSError):
+            return
+        for oid, oid_path in oid_paths:
+            for filename in list(os.listdir(oid_path)):
+                filepath = os.path.join(oid_path, filename)
+                try:
+                    file_oid, serial = self.fshelper.splitBlobFilename(
+                        filepath)
+                except (ValueError, KeyError):
+                    continue
+                if file_oid is None or file_oid != oid:
+                    continue
+                if self._blob_revision_committed(oid, serial):
+                    continue
+                logger.warning(
+                    "Removing uncommitted blob file left over at %s",
+                    filepath)
+                try:
+                    remove_committed(filepath)
+                except OSError:
+                    logger.exception(
+                        "Could not remove stale blob file %s", filepath)
+            if not os.listdir(oid_path):
+                try:
+                    remove_committed_dir(oid_path)
+                except OSError:
+                    logger.exception(
+                        "Could not remove empty blob directory %s", oid_path)
+
     def __getattr__(self, name):
         return getattr(self.__storage, name)
 
@@ -771,7 +872,12 @@ class BlobStorage(BlobStorageMixin):
     def tpc_finish(self, *arg, **kw):
         # We need to override the base storage's tpc_finish instead of
         # providing a _finish method because methods found on the proxied
-        # object aren't rebound to the proxy
+        # object aren't rebound to the proxy.
+        #
+        # If the storage raises, dirty_oids is left intact so the
+        # following fact-based tpc_abort (or the MVCC layer's
+        # recovery) can decide per blob file whether the revision was
+        # published; we must not clear or remove anything optimistically.
         tid = self.__storage.tpc_finish(*arg, **kw)
         self._blob_tpc_finish()
         return tid
@@ -780,8 +886,16 @@ class BlobStorage(BlobStorageMixin):
         # We need to override the base storage's abort instead of
         # providing an _abort method because methods found on the proxied
         # object aren't rebound to the proxy
+        transaction = arg[0] if arg else None
+        state = getattr(transaction, TXN_STATE_ATTR, None)
+        if state is not None and state.is_committed():
+            # An abort following a tpc_finish whose answer was lost after
+            # the storage committed.  The revision and its blob file are
+            # published: never abort the storage nor remove the file.
+            self._blob_tpc_finish()
+            return
         self.__storage.tpc_abort(*arg, **kw)
-        self._blob_tpc_abort()
+        self._blob_tpc_abort(transaction)
 
     def _packUndoing(self, packtime, referencesf):
         # Walk over all existing revisions of all blob files and check

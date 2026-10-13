@@ -298,6 +298,11 @@ class FileStorage(
             self._file.write(packed_version)
 
         self._files = FilePool(self._file_name)
+        # Set when opening the storage truncated a trailing, not yet
+        # committed transaction (crash recovery).  Wrappers such as
+        # BlobStorage use this to reconcile their own staged data with
+        # the storage facts.
+        recovered_truncated = []
         r = self._restore_index()
         if r is not None:
             self._used_index = 1  # Marker for testing
@@ -307,14 +312,17 @@ class FileStorage(
             self._pos, self._oid, tid = read_index(
                 self._file, file_name, index, tindex, stop,
                 ltid=ltid, start=start, read_only=read_only,
+                truncated=recovered_truncated,
             )
         else:
             self._used_index = 0  # Marker for testing
             self._pos, self._oid, tid = read_index(
                 self._file, file_name, index, tindex, stop,
                 read_only=read_only,
+                truncated=recovered_truncated,
             )
             self._save_index()
+        self._recovered_incomplete = bool(recovered_truncated)
 
         self._ltid = tid
 
@@ -1595,7 +1603,8 @@ def recover(file_name):
 
 
 def read_index(file, name, index, tindex, stop=b'\377' * 8,
-               ltid=z64, start=4, maxoid=z64, recover=0, read_only=0):
+               ltid=z64, start=4, maxoid=z64, recover=0, read_only=0,
+               truncated=None):
     """Scan the file storage and update the index.
 
     Returns file position, max oid, and last transaction id.  It also
@@ -1660,6 +1669,8 @@ def read_index(file, name, index, tindex, stop=b'\377' * 8,
                 logger.warning('%s truncated at %s', name, pos)
                 seek(pos)
                 file.truncate()
+                if truncated is not None:
+                    truncated.append(pos)
             break
 
         tid, tl, status, ul, dl, el = unpack(TRANS_HDR, h)
@@ -1677,6 +1688,8 @@ def read_index(file, name, index, tindex, stop=b'\377' * 8,
                 logger.warning("%s truncated, possibly due to damaged"
                                " records at %s", name, pos)
                 _truncate(file, name, pos)
+                if truncated is not None:
+                    truncated.append(pos)
             break
 
         if status not in ' up':
@@ -1702,6 +1715,8 @@ def read_index(file, name, index, tindex, stop=b'\377' * 8,
                         "the file, possibly due to a system crash.  %s "
                         "truncated to recover from bad data at end." % name)
                     _truncate(file, name, pos)
+                    if truncated is not None:
+                        truncated.append(pos)
                 break
             else:
                 if recover:

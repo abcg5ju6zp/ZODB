@@ -216,6 +216,20 @@ class BaseStorage(UndoLogCompatible):
     def tpc_transaction(self):
         return self._transaction
 
+    def tpc_tid(self, transaction):
+        """Return the storage-allocated tid of the live transaction.
+
+        Lets upper layers bind the tentative tid to the recoverable
+        transaction state before tpc_finish, so an uncertain finish can
+        be judged from storage facts even if the finish callback never
+        runs.
+        """
+        with self._lock:
+            if transaction is not self._transaction:
+                raise POSException.StorageTransactionError(
+                    self, transaction)
+            return self._tid
+
     def _begin(self, tid, u, d, e):
         """Subclasses should redefine this to supply transaction start actions.
         """

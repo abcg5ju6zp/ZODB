@@ -58,6 +58,7 @@ from ._compat import _protocol
 from ._compat import dumps
 from ._compat import loads
 from .mvccadapter import HistoricalStorageAdapter
+from .mvccadapter import TXN_STATE_ATTR
 
 
 global_reset_counter = 0
@@ -623,6 +624,19 @@ class Connection(ExportImport):
     def tpc_abort(self, transaction):
         transaction = transaction.data(self)
 
+        state = self._txn_state(transaction)
+        if state is not None and state.is_committed():
+            # tpc_finish reported an error after the storage already
+            # committed (or abort races with such a finish).  The
+            # published version must never be rolled back: complete
+            # the cache side of the commit and return.  The storage
+            # layers skipped their abort cleanup for the same verdict.
+            serial = state.tid
+            if serial is not None:
+                self._finish_cache(serial, state)
+            self._tpc_cleanup()
+            return
+
         if self._import:
             self._import = None
 
@@ -694,13 +708,18 @@ class Connection(ExportImport):
                 if obj is not None:
                     del obj._p_changed  # transition from changed to ghost
 
-    def tpc_finish(self, transaction):
-        """Indicate confirmation that the transaction is done.
-        """
-        transaction = transaction.data(self)
+    def _txn_state(self, transaction):
+        return getattr(transaction, TXN_STATE_ATTR, None)
 
-        serial = self._storage.tpc_finish(transaction)
-        assert type(serial) is bytes, repr(serial)
+    def _finish_cache(self, serial, state=None):
+        """Update the cache for a committed transaction, exactly once.
+
+        Shared by the normal tpc_finish path and recovery after an
+        uncertain tpc_finish whose storage facts prove the transaction
+        did commit.  Never rolls back published data.
+        """
+        if state is not None and state.cache_completed:
+            return
         for oid_iterator in self._modified, self._creating:
             for oid in oid_iterator:
                 obj = self._cache.get(oid)
@@ -708,6 +727,22 @@ class Connection(ExportImport):
                 if obj is not None and obj._p_changed is not None:
                     obj._p_changed = 0
                     obj._p_serial = serial
+        if state is not None:
+            state.note_cache_completed()
+
+    def tpc_finish(self, transaction):
+        """Indicate confirmation that the transaction is done.
+        """
+        transaction = transaction.data(self)
+        state = self._txn_state(transaction)
+
+        # The storage layer resolves an uncertain finish from storage
+        # facts: it either returns the committed tid or raises only
+        # when the transaction really did not commit.  It never asks the
+        # storage to write the same transaction twice.
+        serial = self._storage.tpc_finish(transaction)
+        assert type(serial) is bytes, repr(serial)
+        self._finish_cache(serial, state)
         self._tpc_cleanup()
 
     def sortKey(self):

@@ -5,7 +5,20 @@
 6.5 (unreleased)
 ================
 
-- Nothing changed yet.
+- Give each two-phase commit a stable identity and a recoverable
+  phase.  The storage-allocated tid, the object data, blob files, the
+  connection's created objects and MVCC invalidations are now bound to
+  one shared transaction state.  When ``tpc_finish`` fails after the
+  storage committed, when its response is lost, when the finish
+  callback fails or when the connection is closed before cleanup, the
+  outcome is determined from storage facts and the downstream steps
+  (cache invalidation, blob finalization, caller result) are completed
+  exactly once; the transaction is never written twice and a published
+  revision is never rolled back.  Vote failures, aborts concurrent with
+  a finish, multiple connections sharing an MVCC adapter and storage
+  reopen are recovered individually while preserving transaction
+  order.  Read-only transactions, empty transactions, normal commits
+  and savepoints are unchanged.
 
 
 6.4 (2026-10-12)

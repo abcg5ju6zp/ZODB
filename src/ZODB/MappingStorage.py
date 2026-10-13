@@ -329,6 +329,14 @@ class MappingStorage:
         return self._transaction
 
     # ZODB.interfaces.IStorage
+    def tpc_tid(self, transaction):
+        with self._lock:
+            if transaction is not self._transaction:
+                raise ZODB.POSException.StorageTransactionError(
+                    self, transaction)
+            return self._tid
+
+    # ZODB.interfaces.IStorage
     def tpc_vote(self, transaction):
         if transaction is not self._transaction:
             raise ZODB.POSException.StorageTransactionError(
