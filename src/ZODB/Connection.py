@@ -194,6 +194,11 @@ class Connection(ExportImport):
         # method.  If _import is not None, it is a two-tuple of arguments
         # to pass to _importDuringCommit().
         self._import = None
+        # Version 2 exports additionally carry a persistent import plan
+        # that has to be informed when the surrounding transaction
+        # finishes or aborts, so it can either record the committed OID
+        # mapping or keep its durable progress for retry.
+        self._import_plan = None
 
         self._reader = ObjectReader(self, self._cache, self._db.classFactory)
 
@@ -417,8 +422,34 @@ class Connection(ExportImport):
         if self._savepoint_storage is not None:
             self._abort_savepoint()
 
+        self._abort_import_plan()
         self._invalidate_creating()
         self._tpc_cleanup()
+
+    def _abort_import_plan(self):
+        plan = self._import_plan
+        if plan is not None:
+            self._import_plan = None
+            try:
+                plan.publish_failed()
+            except Exception:
+                self._log.exception(
+                    "Failed to clean up failed import %r",
+                    getattr(plan, 'export_id', None))
+
+    def _finish_import_plan(self, serial):
+        plan = self._import_plan
+        if plan is not None:
+            self._import_plan = None
+            try:
+                plan.committed(serial)
+            except Exception:
+                # The storage commit already succeeded; never turn
+                # this into a failed transaction.  The next import of
+                # the same export reconciles the missing marker.
+                self._log.exception(
+                    "Failed to record committed import %r",
+                    getattr(plan, 'export_id', None))
 
     def _abort(self):
         """Abort a transaction and forget all changes."""
@@ -626,6 +657,8 @@ class Connection(ExportImport):
         if self._import:
             self._import = None
 
+        self._abort_import_plan()
+
         if self._savepoint_storage is not None:
             self._abort_savepoint()
 
@@ -708,6 +741,7 @@ class Connection(ExportImport):
                 if obj is not None and obj._p_changed is not None:
                     obj._p_changed = 0
                     obj._p_serial = serial
+        self._finish_import_plan(serial)
         self._tpc_cleanup()
 
     def sortKey(self):

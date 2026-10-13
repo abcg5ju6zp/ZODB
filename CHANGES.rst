@@ -5,7 +5,36 @@
 6.5 (unreleased)
 ================
 
-- Nothing changed yet.
+- Add a versioned, integrity-protected export/import format (``ZEX2``).
+  Exports that contain blobs automatically use the new format; blob-free
+  graphs keep the legacy ``ZEXP`` format unless ``format='v2'`` is passed
+  to ``Connection.exportFile``.
+
+  The new format frames every record with its length and a SHA-256
+  digest, includes a whole-graph integrity digest in the footer, and
+  carries an export identity so object records, reference relationships
+  and blob data belong to the same export.
+
+  ``Connection.importFile`` validates the format, all references and all
+  blob data *before* publishing any object, then publishes the complete
+  remapped object graph in a single transaction.  A persistent progress
+  journal (stored next to the blob storage's temporary directory) records
+  confirmed OID mappings and staged records, so:
+
+  - large files are streamed and an interrupted import resumes from the
+    last confirmed record boundary;
+  - retrying the same export reuses already-confirmed OID mappings and
+    never creates duplicate objects;
+  - re-importing an export that was already committed returns the
+    original root object;
+  - record truncation, integrity-check failure, blob staging failure and
+    ``tpc_vote``/``tpc_finish`` failure clean up unpublished resources
+    and either retry from durable progress or roll back;
+  - a process restart continues from the on-disk journal.
+
+  Legacy ``ZEXP`` files continue to import unchanged, and non-blob
+  object graphs, transaction abort and custom importers keep their
+  existing behaviour.
 
 
 6.4 (2026-10-12)
